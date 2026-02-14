@@ -81,6 +81,13 @@ class EVResult(BaseModel):
     recommended_stake: float   # after half-kelly & caps
 
 
+class SignalType(str, Enum):
+    STRONG_BUY = "강력매수"
+    BUY = "매수"
+    HOLD = "보류"
+    SKIP = "패스"
+
+
 class AnalysisRow(BaseModel):
     """One row in the main analysis table."""
     market_question: str
@@ -102,7 +109,9 @@ class AnalysisRow(BaseModel):
     roi_pct: float = 0.0
     kelly_raw: float = 0.0
     stake: float = 0.0
-    confidence: str = "market-implied"
+    signal: str = "보류"
+    confidence: str = "마켓추정"
+    confidence_score: float = 0.0  # 0~1 confidence level
     claude_flags: str = ""
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -128,8 +137,9 @@ class ClaudeAnalysis(BaseModel):
 
 class AppSettings(BaseModel):
     bankroll: float = 5000.0
-    kelly_fraction: float = 0.5
-    max_bet_pct: float = 0.03
+    kelly_fraction: float = 0.25        # quarter-Kelly (보수적)
+    max_bet_pct: float = 0.05           # 최대 5%
+    min_stake: float = 1.0              # 최소 베팅 $1
     min_edge: float = 0.0
     min_liquidity: float = 0.0
     claude_enabled: bool = False
