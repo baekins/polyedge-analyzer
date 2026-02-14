@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polyedge-analyzer"
+version = "0.1.0"
+description = "Polymarket Sports EV/Edge Analyzer – Desktop App"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6,<6.9",
+    "httpx>=0.27,<1",
+    "websockets>=12,<14",
+    "pydantic>=2.5,<3",
+    "pydantic-settings>=2.1,<3",
+    "anthropic>=0.40,<1",
+    "pandas>=2.1,<3",
+    "cachetools>=5.3,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+    "pytest-qt>=4.3,<5",
+    "ruff>=0.4",
+    "mypy>=1.9",
+    "pyinstaller>=6.5,<7",
+]
+
+[project.scripts]
+polyedge = "app.main:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
