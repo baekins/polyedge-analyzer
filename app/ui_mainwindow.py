@@ -419,7 +419,7 @@ class MainWindow(QMainWindow):
         self.edge_filter = QDoubleSpinBox()
         self.edge_filter.setRange(-1.0, 1.0)
         self.edge_filter.setSingleStep(0.01)
-        self.edge_filter.setValue(self.settings.min_edge)
+        self.edge_filter.setValue(-1.0)
         self.edge_filter.valueChanged.connect(self._apply_filters)
         top.addWidget(self.edge_filter)
 
