@@ -341,12 +341,13 @@ class FetchWorker(QThread):
                                 b_bid = max(0.01, 1.0 - ya)
                                 b_ask = min(0.99, 1.0 - yb)
 
+                            # ── 극단 확률 스킵 (85%+ 는 수익성 없음) ──
+                            if p_hat > 0.85 or p_hat < 0.05:
+                                continue
+
                             spread = max(0.0, b_ask - b_bid)
                             mid = (b_bid + b_ask) / 2
                             ep = compute_q_eff(b_ask, fee)
-
-                            # 진입 비용 비율: (유효매수가 - 공정확률) / 공정확률
-                            entry_cost_pct = (ep.q_eff - p_hat) / p_hat * 100 if p_hat > 0 else 999
 
                             edge = compute_edge(p_hat, ep.q_eff)
                             ev_dollar = compute_ev_per_dollar(p_hat, ep.q_eff)
@@ -369,14 +370,15 @@ class FetchWorker(QThread):
                                 available_liquidity=em.liquidity,
                             )
 
-                            # 진입 비용 기반 시그널 분류
-                            if entry_cost_pct < 1.5:
+                            # ── 엣지 기반 시그널 (실제 수익성 반영) ──
+                            edge_pct = edge * 100  # 소수 → 퍼센트
+                            if edge_pct > 2.0:
                                 sig = "강력매수"
-                            elif entry_cost_pct < 3.0:
+                            elif edge_pct > 0.5:
                                 sig = "매수"
-                            elif entry_cost_pct < 5.0:
+                            elif edge_pct > -1.0:
                                 sig = "주목"
-                            elif entry_cost_pct < 8.0:
+                            elif edge_pct > -3.0:
                                 sig = "보류"
                             else:
                                 sig = "패스"
