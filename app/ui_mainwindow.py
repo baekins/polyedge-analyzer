@@ -234,8 +234,7 @@ class FetchWorker(QThread):
 
     def run(self) -> None:
         try:
-            from core.polymarket_gamma import GammaClient
-            from core.polymarket_clob import CLOBClient
+            from core.polymarket_gamma import GammaClient, DEFAULT_FEE_BPS
             from core.pricing import compute_q_eff
             from core.ev import (
                 compute_edge, compute_ev_per_dollar, compute_roi_pct,
@@ -245,34 +244,54 @@ class FetchWorker(QThread):
             from core.models import combine_probabilities, compute_confidence_score
             from core.schemas import FeeInfo
 
-            self.progress.emit("Gamma API에서 스포츠 마켓 조회 중...")
+            self.progress.emit("Gamma API에서 활성 마켓 조회 중...")
             gamma = GammaClient()
-            markets = gamma.fetch_all_sports_markets(max_pages=3, page_size=50)
-            self.progress.emit(f"{len(markets)}개 마켓 발견. 가격 조회 중...")
+            markets = gamma.fetch_all_active_markets(max_pages=5, page_size=20)
+            self.progress.emit(f"{len(markets)}개 마켓 발견. 분석 중...")
 
-            clob = CLOBClient()
+            # 기본 수수료: Polymarket taker fee ~2% (200 bps)
+            default_fee = FeeInfo(fee_rate_bps=DEFAULT_FEE_BPS, fee_rate=DEFAULT_FEE_BPS / 10000)
+
             rows: list[AnalysisRow] = []
 
             for mkt in markets:
-                for token in mkt.tokens:
+                # Gamma API가 이미 마켓 단위 가격 데이터를 제공
+                # outcome_prices: [Yes가격, No가격, ...]
+                outcome_prices = mkt.outcome_prices or []
+
+                for idx, token in enumerate(mkt.tokens):
                     try:
-                        price_info = clob.get_price_info(token.token_id)
-                        if price_info.best_ask is None:
-                            continue
+                        # 토큰별 가격 결정
+                        if idx < len(outcome_prices) and outcome_prices[idx] > 0:
+                            token_price = outcome_prices[idx]
+                        elif mkt.best_ask is not None:
+                            token_price = mkt.best_ask
+                        else:
+                            continue  # 가격 데이터 없으면 스킵
 
-                        fee_info = clob.get_fee_rate(token.token_id)
+                        # bid/ask 추정 (Gamma 마켓 레벨 데이터 활용)
+                        best_ask = token_price
+                        best_bid = mkt.best_bid if mkt.best_bid is not None else max(0.01, token_price - 0.02)
+                        spread = mkt.spread if mkt.spread is not None else abs(best_ask - best_bid)
+                        mid = (best_bid + best_ask) / 2
 
-                        ep = compute_q_eff(price_info.best_ask, fee_info)
+                        # 유효 매수가 계산 (수수료 반영)
+                        ep = compute_q_eff(best_ask, default_fee)
 
-                        # p̂ = 마켓 중간가 (MVP 기본값)
-                        p_mkt = price_info.mid if price_info.mid else price_info.best_ask
+                        # p̂ = 마켓 중간가 기반 추정확률
+                        p_mkt = mid if mid > 0 else best_ask
                         p_hat = combine_probabilities(p_mkt)
+
+                        # 유동성 기반 잔량 추정 (Gamma는 총 유동성만 제공)
+                        est_depth = mkt.liquidity / max(len(mkt.tokens), 1) / 2
+                        bid_depth = est_depth
+                        ask_depth = est_depth
 
                         # 신뢰도 점수
                         conf_score = compute_confidence_score(
-                            spread=price_info.spread,
-                            bid_depth=price_info.bid_depth,
-                            ask_depth=price_info.ask_depth,
+                            spread=spread,
+                            bid_depth=bid_depth,
+                            ask_depth=ask_depth,
                             num_sources=1,
                         )
 
@@ -288,15 +307,15 @@ class FetchWorker(QThread):
                             max_bet_pct=self.settings.max_bet_pct,
                             min_stake=self.settings.min_stake,
                             confidence=conf_score,
-                            available_liquidity=price_info.bid_depth + price_info.ask_depth,
+                            available_liquidity=mkt.liquidity,
                         )
 
                         signal = classify_signal(
                             edge=edge,
                             roi_pct=roi,
                             confidence_score=conf_score,
-                            bid_depth=price_info.bid_depth,
-                            ask_depth=price_info.ask_depth,
+                            bid_depth=bid_depth,
+                            ask_depth=ask_depth,
                         )
 
                         rows.append(AnalysisRow(
@@ -305,13 +324,13 @@ class FetchWorker(QThread):
                             outcome=token.outcome,
                             token_id=token.token_id,
                             slug=mkt.event_slug or mkt.slug,
-                            best_bid=price_info.best_bid,
-                            best_ask=price_info.best_ask,
-                            mid=price_info.mid,
-                            spread=price_info.spread,
-                            bid_depth=price_info.bid_depth,
-                            ask_depth=price_info.ask_depth,
-                            fee_rate_bps=fee_info.fee_rate_bps,
+                            best_bid=best_bid,
+                            best_ask=best_ask,
+                            mid=mid,
+                            spread=spread,
+                            bid_depth=bid_depth,
+                            ask_depth=ask_depth,
+                            fee_rate_bps=default_fee.fee_rate_bps,
                             p_hat=p_hat,
                             q_eff=ep.q_eff,
                             edge=edge,
@@ -325,6 +344,8 @@ class FetchWorker(QThread):
                     except Exception as exc:
                         logger.warning("토큰 처리 오류 %s: %s", token.token_id, exc)
 
+            # 엣지 기준 내림차순 정렬
+            rows.sort(key=lambda r: r.edge, reverse=True)
             self.progress.emit(f"분석 완료. {len(rows)}개 결과 처리됨.")
             self.finished.emit(rows)
         except Exception as exc:
