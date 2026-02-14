@@ -256,37 +256,53 @@ class FetchWorker(QThread):
             rows: list[AnalysisRow] = []
 
             for mkt in markets:
-                # Gamma API가 이미 마켓 단위 가격 데이터를 제공
-                # outcome_prices: [Yes가격, No가격, ...]
+                # Gamma API: outcome_prices = [Yes가격, No가격, ...]
+                # best_bid/best_ask = Yes 토큰의 bid/ask
                 outcome_prices = mkt.outcome_prices or []
+                if not outcome_prices:
+                    continue
 
-                # 마켓 레벨 스프레드 (없으면 기본 2%)
-                mkt_spread = mkt.spread if mkt.spread is not None else 0.02
+                # 마켓 레벨 bid/ask (Yes 토큰 기준)
+                yes_bid = float(mkt.best_bid) if mkt.best_bid is not None else None
+                yes_ask = float(mkt.best_ask) if mkt.best_ask is not None else None
+                mkt_spread = float(mkt.spread) if mkt.spread is not None else 0.02
 
                 for idx, token in enumerate(mkt.tokens):
                     try:
-                        # 토큰별 가격: outcome_prices에서 해당 토큰의 가격 사용
-                        if idx < len(outcome_prices) and outcome_prices[idx] > 0:
-                            token_price = outcome_prices[idx]
-                        else:
-                            continue  # 가격 데이터 없으면 스킵
-
-                        # 거의 확정된 결과 스킵 (0.02~0.98 범위만 분석)
-                        if token_price < 0.02 or token_price > 0.98:
+                        if idx >= len(outcome_prices) or outcome_prices[idx] <= 0:
                             continue
 
-                        # 토큰별 bid/ask 추정 (토큰 가격 중심으로 스프레드 배분)
-                        half_spread = mkt_spread / 2
-                        best_ask = min(0.99, token_price + half_spread)
-                        best_bid = max(0.01, token_price - half_spread)
-                        spread = best_ask - best_bid
-                        mid = token_price  # 토큰 자체 가격이 mid
+                        token_price = outcome_prices[idx]
 
-                        # 유효 매수가 계산 (수수료 반영)
+                        # 거의 확정된 결과 스킵 (0.03~0.97 범위만)
+                        if token_price < 0.03 or token_price > 0.97:
+                            continue
+
+                        # 토큰별 실제 bid/ask 계산
+                        if idx == 0 and yes_bid is not None and yes_ask is not None:
+                            # Yes 토큰: Gamma API의 bid/ask 직접 사용
+                            best_bid = yes_bid
+                            best_ask = yes_ask
+                        elif idx == 1 and yes_bid is not None and yes_ask is not None:
+                            # No 토큰: Yes의 역수 (No bid = 1-Yes ask, No ask = 1-Yes bid)
+                            best_bid = max(0.01, 1.0 - yes_ask)
+                            best_ask = min(0.99, 1.0 - yes_bid)
+                        else:
+                            # 다중 결과 마켓: 토큰 가격 ± 스프레드/2
+                            half_sp = mkt_spread / 2
+                            best_bid = max(0.01, token_price - half_sp)
+                            best_ask = min(0.99, token_price + half_sp)
+
+                        spread = max(0.0, best_ask - best_bid)
+                        mid = (best_bid + best_ask) / 2
+
+                        # p̂ = mid (시장 합의 추정확률)
+                        # q_eff = ask + 수수료 (실제 매수 비용)
+                        # 엣지 = p̂ - q_eff (mid가 ask보다 높으면 +엣지)
+                        p_hat = combine_probabilities(mid)
+
+                        # 유효 매수가 계산 (ask 기반 + 수수료)
                         ep = compute_q_eff(best_ask, default_fee)
-
-                        # p̂ = 토큰 가격 기반 추정확률 (토큰 가격 자체가 시장 확률)
-                        p_hat = combine_probabilities(token_price)
 
                         # 유동성 기반 잔량 추정 (Gamma는 총 유동성만 제공)
                         est_depth = mkt.liquidity / max(len(mkt.tokens), 1) / 2
@@ -401,7 +417,7 @@ class MainWindow(QMainWindow):
         self.lbl_filter = QLabel("최소 엣지:")
         top.addWidget(self.lbl_filter)
         self.edge_filter = QDoubleSpinBox()
-        self.edge_filter.setRange(-1, 1)
+        self.edge_filter.setRange(-1.0, 1.0)
         self.edge_filter.setSingleStep(0.01)
         self.edge_filter.setValue(self.settings.min_edge)
         self.edge_filter.valueChanged.connect(self._apply_filters)

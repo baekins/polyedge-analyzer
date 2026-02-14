@@ -145,7 +145,7 @@ class AppSettings(BaseModel):
     kelly_fraction: float = 0.25        # quarter-Kelly (보수적)
     max_bet_pct: float = 0.05           # 최대 5%
     min_stake: float = 1.0              # 최소 베팅 $1
-    min_edge: float = 0.0
+    min_edge: float = -1.0
     min_liquidity: float = 0.0
     claude_enabled: bool = False
     anthropic_api_key: str = ""
