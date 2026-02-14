@@ -1,0 +1,47 @@
+name: Build & Release Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name PolyEdgeAnalyzer --add-data "core;core" --hidden-import PySide6.QtWidgets --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui --hidden-import httpx --hidden-import websockets --hidden-import anthropic --hidden-import cachetools app/main.py
+        shell: cmd
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PolyEdgeAnalyzer-windows
+          path: dist/PolyEdgeAnalyzer.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PolyEdgeAnalyzer.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
