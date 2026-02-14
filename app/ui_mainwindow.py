@@ -244,10 +244,10 @@ class FetchWorker(QThread):
             from core.models import combine_probabilities, compute_confidence_score
             from core.schemas import FeeInfo
 
-            self.progress.emit("Gamma API에서 활성 마켓 조회 중...")
+            self.progress.emit("Gamma API에서 스포츠 마켓 조회 중...")
             gamma = GammaClient()
-            markets = gamma.fetch_all_active_markets(max_pages=5, page_size=20)
-            self.progress.emit(f"{len(markets)}개 마켓 발견. 분석 중...")
+            markets = gamma.fetch_all_active_markets(max_pages=5, page_size=20, tag="sports")
+            self.progress.emit(f"{len(markets)}개 스포츠 마켓 발견. 분석 중...")
 
             # 기본 수수료: Polymarket taker fee ~2% (200 bps)
             _FEE_BPS = 200.0
@@ -260,28 +260,33 @@ class FetchWorker(QThread):
                 # outcome_prices: [Yes가격, No가격, ...]
                 outcome_prices = mkt.outcome_prices or []
 
+                # 마켓 레벨 스프레드 (없으면 기본 2%)
+                mkt_spread = mkt.spread if mkt.spread is not None else 0.02
+
                 for idx, token in enumerate(mkt.tokens):
                     try:
-                        # 토큰별 가격 결정
+                        # 토큰별 가격: outcome_prices에서 해당 토큰의 가격 사용
                         if idx < len(outcome_prices) and outcome_prices[idx] > 0:
                             token_price = outcome_prices[idx]
-                        elif mkt.best_ask is not None:
-                            token_price = mkt.best_ask
                         else:
                             continue  # 가격 데이터 없으면 스킵
 
-                        # bid/ask 추정 (Gamma 마켓 레벨 데이터 활용)
-                        best_ask = token_price
-                        best_bid = mkt.best_bid if mkt.best_bid is not None else max(0.01, token_price - 0.02)
-                        spread = mkt.spread if mkt.spread is not None else abs(best_ask - best_bid)
-                        mid = (best_bid + best_ask) / 2
+                        # 거의 확정된 결과 스킵 (0.02~0.98 범위만 분석)
+                        if token_price < 0.02 or token_price > 0.98:
+                            continue
+
+                        # 토큰별 bid/ask 추정 (토큰 가격 중심으로 스프레드 배분)
+                        half_spread = mkt_spread / 2
+                        best_ask = min(0.99, token_price + half_spread)
+                        best_bid = max(0.01, token_price - half_spread)
+                        spread = best_ask - best_bid
+                        mid = token_price  # 토큰 자체 가격이 mid
 
                         # 유효 매수가 계산 (수수료 반영)
                         ep = compute_q_eff(best_ask, default_fee)
 
-                        # p̂ = 마켓 중간가 기반 추정확률
-                        p_mkt = mid if mid > 0 else best_ask
-                        p_hat = combine_probabilities(p_mkt)
+                        # p̂ = 토큰 가격 기반 추정확률 (토큰 가격 자체가 시장 확률)
+                        p_hat = combine_probabilities(token_price)
 
                         # 유동성 기반 잔량 추정 (Gamma는 총 유동성만 제공)
                         est_depth = mkt.liquidity / max(len(mkt.tokens), 1) / 2
