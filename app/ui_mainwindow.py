@@ -238,164 +238,177 @@ class FetchWorker(QThread):
             from core.pricing import compute_q_eff
             from core.ev import (
                 compute_edge, compute_ev_per_dollar, compute_roi_pct,
-                compute_kelly_fraction, classify_signal,
+                compute_kelly_fraction,
             )
             from core.staking import compute_stake
             from core.models import combine_probabilities, compute_confidence_score
             from core.schemas import FeeInfo
 
-            self.progress.emit("Gamma API에서 라이브 스포츠 마켓 조회 중...")
+            # ── 1) 스포츠 키워드 필터 (tag=sports 믿을 수 없으므로) ──
+            SPORTS_KW = [
+                'nba', 'nfl', 'mlb', 'nhl', 'epl', 'premier league',
+                'champions league', 'europa league', 'euro 20', 'world cup',
+                'fifa', 'ufc', 'boxing', 'tennis', 'f1', 'formula 1',
+                'olympics', 'olympic', 'copa america', 'la liga', 'serie a',
+                'bundesliga', 'ligue 1', 'eredivisie', 'basketball', 'soccer',
+                'baseball', 'hockey', 'cricket', 'rugby', 'golf', 'mma',
+                'grand prix', 'super bowl', 'playoff', 'medal', 'ski',
+                'marathon', 'sprint', 'match', 'game score', 'league',
+                'tournament', 'final', 'semifinal', 'quarterfinal',
+                'arsenal', 'liverpool', 'manchester', 'chelsea', 'tottenham',
+                'barcelona', 'real madrid', 'bayern', 'juventus', 'psg',
+                'napoli', 'dortmund', 'atletico', 'inter milan', 'milan',
+                'lakers', 'celtics', 'warriors', 'knicks', 'nets', 'bucks',
+                '76ers', 'nuggets', 'suns', 'heat', 'bulls', 'mavericks',
+                'yankees', 'dodgers', 'chiefs', 'eagles', 'ravens', 'bills',
+                'win ', 'winner', 'champion', 'title', 'season', 'series',
+            ]
+            NON_SPORTS = [
+                'crypto', 'bitcoin', 'ethereum', 'xrp', 'solana', 'token',
+                'price above', 'price below', 'fed ', 'federal reserve',
+                'election', 'president', 'congress', 'senate', 'trump',
+                'biden', 'legislation', 'tariff', 'inflation', 'gdp',
+                'interest rate', 'stock', 'nasdaq', 's&p', 'dow jones',
+            ]
+
+            def is_sports(m):
+                text = f"{m.event_title} {m.question} {m.category}".lower()
+                if any(ns in text for ns in NON_SPORTS):
+                    return False
+                if 'sport' in text:
+                    return True
+                return any(kw in text for kw in SPORTS_KW)
+
+            # ── 2) 마켓 가져오기 (태그 없이 전체 → 키워드로 필터) ──
+            self.progress.emit("Gamma API에서 전체 마켓 조회 중...")
             gamma = GammaClient()
-            markets = gamma.fetch_all_active_markets(max_pages=10, page_size=50, tag="sports")
+            all_markets = gamma.fetch_all_active_markets(max_pages=10, page_size=50)
 
-            # 라이브 마켓 필터: 거래량 있고 유동성 있는 것만
-            from datetime import datetime as dt, timezone
-            now = dt.now(timezone.utc)
-            live_markets = []
-            for m in markets:
-                # 거래량/유동성 없으면 스킵
-                if m.volume < 100 or m.liquidity < 500:
-                    continue
-                # endDate가 있으면 미래인지 확인 (이미 끝난 이벤트 제외)
-                if m.end_date:
-                    try:
-                        end = m.end_date if hasattr(m.end_date, 'tzinfo') else dt.fromisoformat(str(m.end_date).replace('Z', '+00:00'))
-                        if end.tzinfo is None:
-                            end = end.replace(tzinfo=timezone.utc)
-                        if end < now:
-                            continue
-                    except Exception:
-                        pass
-                live_markets.append(m)
+            sports = [m for m in all_markets if is_sports(m) and m.liquidity >= 100]
+            self.progress.emit(f"스포츠 {len(sports)}개 마켓. 이벤트별 분석 중...")
 
-            self.progress.emit(f"{len(live_markets)}개 라이브 스포츠 마켓 분석 중...")
+            # ── 3) 이벤트별 그룹핑 (멀티 아웃컴 vig 제거용) ──
+            events: dict[str, list] = {}
+            for m in sports:
+                key = m.event_title or m.question
+                events.setdefault(key, []).append(m)
 
-            # 기본 수수료: Polymarket taker fee ~2% (200 bps)
             _FEE_BPS = 200.0
-            default_fee = FeeInfo(fee_rate_bps=_FEE_BPS, fee_rate=_FEE_BPS / 10000)
-
+            fee = FeeInfo(fee_rate_bps=_FEE_BPS, fee_rate=_FEE_BPS / 10000)
             rows: list[AnalysisRow] = []
 
-            for mkt in live_markets:
-                outcome_prices = mkt.outcome_prices or []
-                if len(outcome_prices) < 2:
-                    continue
+            for evt_title, evt_mkts in events.items():
+                # 이벤트 내 모든 Yes 가격 합산 (vig 제거용)
+                yes_prices = []
+                for em in evt_mkts:
+                    op = em.outcome_prices or []
+                    if op and op[0] > 0:
+                        yes_prices.append(op[0])
 
-                # 마켓 레벨 bid/ask (Yes 토큰 기준)
-                yes_bid = float(mkt.best_bid) if mkt.best_bid is not None else None
-                yes_ask = float(mkt.best_ask) if mkt.best_ask is not None else None
-                mkt_spread = float(mkt.spread) if mkt.spread is not None else 0.02
+                evt_total = sum(yes_prices) if yes_prices else 1.0
+                is_multi = len(evt_mkts) > 1
 
-                for idx, token in enumerate(mkt.tokens):
-                    try:
-                        if idx >= len(outcome_prices) or outcome_prices[idx] <= 0:
-                            continue
+                for em in evt_mkts:
+                    op = em.outcome_prices or []
+                    if len(op) < 2:
+                        continue
 
-                        token_price = outcome_prices[idx]
+                    yes_p, no_p = op[0], op[1]
 
-                        # 거의 확정된 결과 스킵 (0.05~0.95 범위만)
-                        if token_price < 0.05 or token_price > 0.95:
-                            continue
+                    # vig 제거: 멀티 아웃컴이면 이벤트 합계로 나눔
+                    if is_multi and evt_total > 0:
+                        fair_yes = yes_p / evt_total
+                    else:
+                        mkt_total = yes_p + no_p
+                        fair_yes = yes_p / mkt_total if mkt_total > 0 else yes_p
+                    fair_no = 1.0 - fair_yes
+                    fair_yes = max(0.01, min(0.99, fair_yes))
+                    fair_no = max(0.01, min(0.99, fair_no))
 
-                        # ── 핵심: 상대 토큰 가격으로 p̂ 계산 ──
-                        # Yes면 p̂ = 1 - No_price, No면 p̂ = 1 - Yes_price
-                        # 양쪽 가격이 안 맞으면 → 엣지 발생!
-                        complement_idx = 1 - idx if len(outcome_prices) == 2 else None
-                        if complement_idx is not None and complement_idx < len(outcome_prices):
-                            complement_price = outcome_prices[complement_idx]
-                            p_hat_raw = 1.0 - complement_price
-                        else:
-                            # 다중결과: 전체 합 기반 vig 제거
-                            total = sum(outcome_prices)
-                            p_hat_raw = token_price / total if total > 0 else token_price
+                    yb = float(em.best_bid) if em.best_bid is not None else max(0.01, yes_p - 0.01)
+                    ya = float(em.best_ask) if em.best_ask is not None else min(0.99, yes_p + 0.01)
 
-                        p_hat_raw = max(0.01, min(0.99, p_hat_raw))
+                    for idx, tok in enumerate(em.tokens):
+                        try:
+                            if idx >= len(op) or op[idx] < 0.03 or op[idx] > 0.97:
+                                continue
 
-                        # 토큰별 실제 bid/ask
-                        if idx == 0 and yes_bid is not None and yes_ask is not None:
-                            best_bid = yes_bid
-                            best_ask = yes_ask
-                        elif idx == 1 and yes_bid is not None and yes_ask is not None:
-                            best_bid = max(0.01, 1.0 - yes_ask)
-                            best_ask = min(0.99, 1.0 - yes_bid)
-                        else:
-                            half_sp = mkt_spread / 2
-                            best_bid = max(0.01, token_price - half_sp)
-                            best_ask = min(0.99, token_price + half_sp)
+                            if idx == 0:
+                                p_hat = fair_yes
+                                b_bid, b_ask = yb, ya
+                            else:
+                                p_hat = fair_no
+                                b_bid = max(0.01, 1.0 - ya)
+                                b_ask = min(0.99, 1.0 - yb)
 
-                        spread = max(0.0, best_ask - best_bid)
-                        mid = (best_bid + best_ask) / 2
+                            spread = max(0.0, b_ask - b_bid)
+                            mid = (b_bid + b_ask) / 2
+                            ep = compute_q_eff(b_ask, fee)
 
-                        p_hat = combine_probabilities(p_hat_raw)
+                            # 진입 비용 비율: (유효매수가 - 공정확률) / 공정확률
+                            entry_cost_pct = (ep.q_eff - p_hat) / p_hat * 100 if p_hat > 0 else 999
 
-                        # 유효 매수가 계산 (ask 기반 + 수수료)
-                        ep = compute_q_eff(best_ask, default_fee)
+                            edge = compute_edge(p_hat, ep.q_eff)
+                            ev_dollar = compute_ev_per_dollar(p_hat, ep.q_eff)
+                            roi = compute_roi_pct(p_hat, ep.q_eff)
+                            kelly = compute_kelly_fraction(p_hat, ep.q_eff)
 
-                        # 유동성 기반 잔량 추정
-                        est_depth = mkt.liquidity / max(len(mkt.tokens), 1) / 2
-                        bid_depth = est_depth
-                        ask_depth = est_depth
+                            depth = em.liquidity / max(len(em.tokens), 1) / 2
+                            conf = compute_confidence_score(
+                                spread=spread, bid_depth=depth,
+                                ask_depth=depth, num_sources=1,
+                            )
 
-                        # 신뢰도 점수
-                        conf_score = compute_confidence_score(
-                            spread=spread,
-                            bid_depth=bid_depth,
-                            ask_depth=ask_depth,
-                            num_sources=1,
-                        )
+                            stake = compute_stake(
+                                p_hat, ep.q_eff,
+                                bankroll=self.settings.bankroll,
+                                kelly_fraction=self.settings.kelly_fraction,
+                                max_bet_pct=self.settings.max_bet_pct,
+                                min_stake=self.settings.min_stake,
+                                confidence=conf,
+                                available_liquidity=em.liquidity,
+                            )
 
-                        edge = compute_edge(p_hat, ep.q_eff)
-                        ev_dollar = compute_ev_per_dollar(p_hat, ep.q_eff)
-                        roi = compute_roi_pct(p_hat, ep.q_eff)
-                        kelly = compute_kelly_fraction(p_hat, ep.q_eff)
+                            # 진입 비용 기반 시그널 분류
+                            if entry_cost_pct < 1.5:
+                                sig = "강력매수"
+                            elif entry_cost_pct < 3.0:
+                                sig = "매수"
+                            elif entry_cost_pct < 5.0:
+                                sig = "주목"
+                            elif entry_cost_pct < 8.0:
+                                sig = "보류"
+                            else:
+                                sig = "패스"
 
-                        stake = compute_stake(
-                            p_hat, ep.q_eff,
-                            bankroll=self.settings.bankroll,
-                            kelly_fraction=self.settings.kelly_fraction,
-                            max_bet_pct=self.settings.max_bet_pct,
-                            min_stake=self.settings.min_stake,
-                            confidence=conf_score,
-                            available_liquidity=mkt.liquidity,
-                        )
+                            rows.append(AnalysisRow(
+                                market_question=em.question,
+                                event_title=em.event_title,
+                                outcome=tok.outcome,
+                                token_id=tok.token_id,
+                                slug=em.event_slug or em.slug,
+                                best_bid=b_bid,
+                                best_ask=b_ask,
+                                mid=mid,
+                                spread=spread,
+                                bid_depth=depth,
+                                ask_depth=depth,
+                                fee_rate_bps=fee.fee_rate_bps,
+                                p_hat=p_hat,
+                                q_eff=ep.q_eff,
+                                edge=edge,
+                                ev_per_dollar=ev_dollar,
+                                roi_pct=roi,
+                                kelly_raw=kelly,
+                                stake=stake,
+                                signal=sig,
+                                confidence_score=conf,
+                            ))
+                        except Exception as exc:
+                            logger.warning("토큰 처리 오류 %s: %s", tok.token_id, exc)
 
-                        signal = classify_signal(
-                            edge=edge,
-                            roi_pct=roi,
-                            confidence_score=conf_score,
-                            bid_depth=bid_depth,
-                            ask_depth=ask_depth,
-                        )
-
-                        rows.append(AnalysisRow(
-                            market_question=mkt.question,
-                            event_title=mkt.event_title,
-                            outcome=token.outcome,
-                            token_id=token.token_id,
-                            slug=mkt.event_slug or mkt.slug,
-                            best_bid=best_bid,
-                            best_ask=best_ask,
-                            mid=mid,
-                            spread=spread,
-                            bid_depth=bid_depth,
-                            ask_depth=ask_depth,
-                            fee_rate_bps=default_fee.fee_rate_bps,
-                            p_hat=p_hat,
-                            q_eff=ep.q_eff,
-                            edge=edge,
-                            ev_per_dollar=ev_dollar,
-                            roi_pct=roi,
-                            kelly_raw=kelly,
-                            stake=stake,
-                            signal=signal,
-                            confidence_score=conf_score,
-                        ))
-                    except Exception as exc:
-                        logger.warning("토큰 처리 오류 %s: %s", token.token_id, exc)
-
-            # 엣지 기준 내림차순 정렬
             rows.sort(key=lambda r: r.edge, reverse=True)
-            self.progress.emit(f"분석 완료. {len(rows)}개 결과 처리됨.")
+            self.progress.emit(f"분석 완료. {len(rows)}개 결과.")
             self.finished.emit(rows)
         except Exception as exc:
             logger.exception("FetchWorker 오류")
@@ -544,7 +557,7 @@ class MainWindow(QMainWindow):
         self.btn_fetch.setText("📊 마켓 분석")
 
         # 요약 통계
-        buy_count = sum(1 for r in rows if r.signal in ("매수", "강력매수"))
+        buy_count = sum(1 for r in rows if r.signal in ("매수", "강력매수", "주목"))
         total_stake = sum(r.stake for r in rows)
         avg_edge = sum(r.edge for r in rows) / len(rows) * 100 if rows else 0
 
@@ -605,6 +618,8 @@ class MainWindow(QMainWindow):
                         item.setFont(QFont("Segoe UI", weight=QFont.Weight.Bold))
                     elif val == "매수":
                         item.setForeground(QColor("#4ade80"))
+                    elif val == "주목":
+                        item.setForeground(QColor("#fb923c"))
                     elif val == "보류":
                         item.setForeground(QColor("#fbbf24"))
                     else:  # 패스
