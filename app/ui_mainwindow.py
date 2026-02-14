@@ -234,7 +234,7 @@ class FetchWorker(QThread):
 
     def run(self) -> None:
         try:
-            from core.polymarket_gamma import GammaClient, DEFAULT_FEE_BPS
+            from core.polymarket_gamma import GammaClient
             from core.pricing import compute_q_eff
             from core.ev import (
                 compute_edge, compute_ev_per_dollar, compute_roi_pct,
@@ -250,7 +250,8 @@ class FetchWorker(QThread):
             self.progress.emit(f"{len(markets)}개 마켓 발견. 분석 중...")
 
             # 기본 수수료: Polymarket taker fee ~2% (200 bps)
-            default_fee = FeeInfo(fee_rate_bps=DEFAULT_FEE_BPS, fee_rate=DEFAULT_FEE_BPS / 10000)
+            _FEE_BPS = 200.0
+            default_fee = FeeInfo(fee_rate_bps=_FEE_BPS, fee_rate=_FEE_BPS / 10000)
 
             rows: list[AnalysisRow] = []
 
