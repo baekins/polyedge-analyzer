@@ -244,10 +244,31 @@ class FetchWorker(QThread):
             from core.models import combine_probabilities, compute_confidence_score
             from core.schemas import FeeInfo
 
-            self.progress.emit("Gamma API에서 스포츠 마켓 조회 중...")
+            self.progress.emit("Gamma API에서 라이브 스포츠 마켓 조회 중...")
             gamma = GammaClient()
-            markets = gamma.fetch_all_active_markets(max_pages=5, page_size=20, tag="sports")
-            self.progress.emit(f"{len(markets)}개 스포츠 마켓 발견. 분석 중...")
+            markets = gamma.fetch_all_active_markets(max_pages=10, page_size=50, tag="sports")
+
+            # 라이브 마켓 필터: 거래량 있고 유동성 있는 것만
+            from datetime import datetime as dt, timezone
+            now = dt.now(timezone.utc)
+            live_markets = []
+            for m in markets:
+                # 거래량/유동성 없으면 스킵
+                if m.volume < 100 or m.liquidity < 500:
+                    continue
+                # endDate가 있으면 미래인지 확인 (이미 끝난 이벤트 제외)
+                if m.end_date:
+                    try:
+                        end = m.end_date if hasattr(m.end_date, 'tzinfo') else dt.fromisoformat(str(m.end_date).replace('Z', '+00:00'))
+                        if end.tzinfo is None:
+                            end = end.replace(tzinfo=timezone.utc)
+                        if end < now:
+                            continue
+                    except Exception:
+                        pass
+                live_markets.append(m)
+
+            self.progress.emit(f"{len(live_markets)}개 라이브 스포츠 마켓 분석 중...")
 
             # 기본 수수료: Polymarket taker fee ~2% (200 bps)
             _FEE_BPS = 200.0
@@ -255,11 +276,9 @@ class FetchWorker(QThread):
 
             rows: list[AnalysisRow] = []
 
-            for mkt in markets:
-                # Gamma API: outcome_prices = [Yes가격, No가격, ...]
-                # best_bid/best_ask = Yes 토큰의 bid/ask
+            for mkt in live_markets:
                 outcome_prices = mkt.outcome_prices or []
-                if not outcome_prices:
+                if len(outcome_prices) < 2:
                     continue
 
                 # 마켓 레벨 bid/ask (Yes 토큰 기준)
@@ -274,21 +293,32 @@ class FetchWorker(QThread):
 
                         token_price = outcome_prices[idx]
 
-                        # 거의 확정된 결과 스킵 (0.03~0.97 범위만)
-                        if token_price < 0.03 or token_price > 0.97:
+                        # 거의 확정된 결과 스킵 (0.05~0.95 범위만)
+                        if token_price < 0.05 or token_price > 0.95:
                             continue
 
-                        # 토큰별 실제 bid/ask 계산
+                        # ── 핵심: 상대 토큰 가격으로 p̂ 계산 ──
+                        # Yes면 p̂ = 1 - No_price, No면 p̂ = 1 - Yes_price
+                        # 양쪽 가격이 안 맞으면 → 엣지 발생!
+                        complement_idx = 1 - idx if len(outcome_prices) == 2 else None
+                        if complement_idx is not None and complement_idx < len(outcome_prices):
+                            complement_price = outcome_prices[complement_idx]
+                            p_hat_raw = 1.0 - complement_price
+                        else:
+                            # 다중결과: 전체 합 기반 vig 제거
+                            total = sum(outcome_prices)
+                            p_hat_raw = token_price / total if total > 0 else token_price
+
+                        p_hat_raw = max(0.01, min(0.99, p_hat_raw))
+
+                        # 토큰별 실제 bid/ask
                         if idx == 0 and yes_bid is not None and yes_ask is not None:
-                            # Yes 토큰: Gamma API의 bid/ask 직접 사용
                             best_bid = yes_bid
                             best_ask = yes_ask
                         elif idx == 1 and yes_bid is not None and yes_ask is not None:
-                            # No 토큰: Yes의 역수 (No bid = 1-Yes ask, No ask = 1-Yes bid)
                             best_bid = max(0.01, 1.0 - yes_ask)
                             best_ask = min(0.99, 1.0 - yes_bid)
                         else:
-                            # 다중 결과 마켓: 토큰 가격 ± 스프레드/2
                             half_sp = mkt_spread / 2
                             best_bid = max(0.01, token_price - half_sp)
                             best_ask = min(0.99, token_price + half_sp)
@@ -296,15 +326,12 @@ class FetchWorker(QThread):
                         spread = max(0.0, best_ask - best_bid)
                         mid = (best_bid + best_ask) / 2
 
-                        # p̂ = mid (시장 합의 추정확률)
-                        # q_eff = ask + 수수료 (실제 매수 비용)
-                        # 엣지 = p̂ - q_eff (mid가 ask보다 높으면 +엣지)
-                        p_hat = combine_probabilities(mid)
+                        p_hat = combine_probabilities(p_hat_raw)
 
                         # 유효 매수가 계산 (ask 기반 + 수수료)
                         ep = compute_q_eff(best_ask, default_fee)
 
-                        # 유동성 기반 잔량 추정 (Gamma는 총 유동성만 제공)
+                        # 유동성 기반 잔량 추정
                         est_depth = mkt.liquidity / max(len(mkt.tokens), 1) / 2
                         bid_depth = est_depth
                         ask_depth = est_depth
