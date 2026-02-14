@@ -46,6 +46,11 @@ class MarketData(BaseModel):
     liquidity: float = 0.0
     event_slug: str = ""
     event_title: str = ""
+    # Embedded price data from Gamma API
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    spread: Optional[float] = None
+    outcome_prices: list[float] = Field(default_factory=list)
 
 
 # ── Pricing / analysis ───────────────────────────────────────────────────────
